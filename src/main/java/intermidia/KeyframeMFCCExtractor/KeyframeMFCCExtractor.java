@@ -15,7 +15,6 @@ import org.openimaj.audio.SampleChunk;
 import org.openimaj.audio.features.MFCC;
 import org.openimaj.audio.processor.FixedSizeSampleAudioProcessor;
 import org.openimaj.util.pair.IntLongPair;
-import org.openimaj.util.pair.LongLongPair;
 import org.openimaj.video.xuggle.XuggleAudio;
 import org.openimaj.video.xuggle.XuggleVideo;
 
@@ -29,9 +28,42 @@ import TVSSUtils.ShotReader;
 
 public class KeyframeMFCCExtractor 
 {
+	private static class AuralSegment 
+	{
+		private int shotIndex;
+		private int segmentIndex;
+		private long startTime;
+		private long endTime;
+		
+		public AuralSegment(int shot, int segment, long start, long end) 
+		{
+			this.shotIndex = shot;
+			this.segmentIndex = segment;
+			this.startTime = start;
+			this.endTime = end;
+		}
+		
+		public int getShotIndex() 
+		{
+			return shotIndex;
+		}
+		public long getStartTime() 
+		{
+			return startTime;
+		}
+		public long getEndTime() 
+		{
+			return endTime;
+		}
+		public int getSegIndex()
+		{
+			return segmentIndex;
+		}
+	}
+	
 	//Usage: MFCCExtractor <in: video file> <in: shot list csv> <in: keyframe list csv> <out: audio segments output folder> 
 	//<out: mfcc feature vectors file> <in: audio streams> <in: stream to use> <in: audio segment len/2 in ms>
-	//NOTE: audio segment size is input divided by 2 because it is easier to control 
+	//NOTE: audio segment size is input divided by 2 (easier to control) 
     public static void main( String[] args ) throws Exception
     { 	
     	File inputFile = new File(args[0]);
@@ -50,7 +82,9 @@ public class KeyframeMFCCExtractor
     	double videoFPS = inputVideo.getFPS();
     	inputVideo.close();
     	long lastBoundary = 0;
-    	ArrayList<LongLongPair> auralSegments = new ArrayList<LongLongPair>(); 
+    	ArrayList<AuralSegment> auralSegments = new ArrayList<AuralSegment>(); 
+    	int lastShot = 0;
+    	int segmentIndex = 0;
     	for(IntLongPair keyframe : keyframes)
     	{    		
     		
@@ -94,10 +128,19 @@ public class KeyframeMFCCExtractor
     			
     			if(segmentStartTime < segmentEndTime)
     			{
-    				auralSegments.add(new LongLongPair(segmentStartTime, segmentEndTime));
+    				if(keyframe.getFirst() != lastShot)
+    				{
+    					lastShot = keyframe.getFirst();
+    					segmentIndex = 0;
+    				}
+    				else
+    				{
+    					segmentIndex++;
+    				}
+    				auralSegments.add(new AuralSegment(keyframe.getFirst(),segmentIndex, segmentStartTime, segmentEndTime));
     			}
     		}
-    	}
+    	}    	
 
     	//Generate and write MFCC descriptors
 		XuggleAudio inputAudioMFCCRaw = new XuggleAudio(inputFile);    	
@@ -120,28 +163,33 @@ public class KeyframeMFCCExtractor
 	
 		MFCC mfcc = new MFCC( inputAudioMFCC );
 		SampleChunk scMFCC = null;
-		Iterator<LongLongPair> auralSegmentsIterator = auralSegments.iterator();
-		LongLongPair actualSegment = auralSegmentsIterator.next();
+		Iterator<AuralSegment> auralSegmentsIterator = auralSegments.iterator();
+		AuralSegment actualSegment;
 		FileWriter mfccWriter = new FileWriter(args[4]);
 		scMFCC = mfcc.nextSampleChunk();
 		long chunkIndex = 0;
-		while( scMFCC  != null && auralSegmentsIterator.hasNext())
+		long sampleStartTime = scMFCC.getStartTimecode().getTimecodeInMilliseconds()/scMFCC.getFormat().getNumChannels();
+		long sampleEndTime = sampleStartTime + 30;
+		while( auralSegmentsIterator.hasNext() && (actualSegment = auralSegmentsIterator.next()) != null ) 
 		{
-			//I don't know why, but getTimecodeInMilliseconds returns two times the correct timecode.
-			long sampleStartTime = scMFCC.getStartTimecode().getTimecodeInMilliseconds()/scMFCC.getFormat().getNumChannels();
-			long sampleEndTime = sampleStartTime + 30;
+			//I don't know why, but getTimecodeInMilliseconds when using window overlap returns two times the correct timecode.
 			
-			//Iterate to the segment which contains this sample.
-			while(sampleStartTime > actualSegment.getSecond() && auralSegmentsIterator.hasNext())
+			//Look for the audio correspoinding to the segment
+			while(scMFCC != null && sampleStartTime <  actualSegment.getStartTime())
 			{
-				actualSegment = auralSegmentsIterator.next();	        		
-			}   			
-			
-			//If the sample is fully contained inside the segment then write it
-			if(actualSegment.getFirst() < sampleStartTime && actualSegment.getSecond() > sampleEndTime)
-			{    			
+				scMFCC = mfcc.nextSampleChunk();
+				chunkIndex++;
+				sampleStartTime = scMFCC.getStartTimecode().getTimecodeInMilliseconds()/scMFCC.getFormat().getNumChannels();
+				sampleEndTime = sampleStartTime + 30;
+			}
+			//Write it down while
+			while(scMFCC != null && sampleEndTime < actualSegment.getEndTime())
+			{
+				sampleStartTime = scMFCC.getStartTimecode().getTimecodeInMilliseconds()/scMFCC.getFormat().getNumChannels();
+				sampleEndTime = sampleStartTime + 30;
+				
 				double[][] mfccs = mfcc.getLastCalculatedFeature();
-				mfccWriter.write(Long.toString(actualSegment.getFirst()));
+				mfccWriter.write(Long.toString(actualSegment.getShotIndex()));
 				for(int i = 0; i < mfccs[0].length; i++)
 				{
 					mfccWriter.write(" " + mfccs[0][i]);
@@ -154,11 +202,19 @@ public class KeyframeMFCCExtractor
 					byteArrayOutputStream.flush();
 					byteArrayOutputStream.write(scMFCC.getSamples());
 					byteArrayOutputStream.flush(); 
-				}
-				
+				}	
+				scMFCC = mfcc.nextSampleChunk();
+				chunkIndex++;
 			}
-			scMFCC = mfcc.nextSampleChunk();
-			chunkIndex++;  
+			
+			//Write file on disk
+			ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(byteArrayOutputStream.toByteArray());
+			AudioInputStream audioInputStream = new AudioInputStream(byteArrayInputStream, inputAudioMFCC.getFormat().getJavaAudioFormat(), byteArrayOutputStream.size());
+			String audioSampleName = "shot" + String.format("%04d", actualSegment.getShotIndex()) + "seg" + String.format("%04d", actualSegment.getSegIndex()) + ".wav";
+			AudioSystem.write(audioInputStream, AudioFileFormat.Type.WAVE, new File(outputAudiosFolder + audioSampleName));			
+			//Clear the byteArrayOutputStream
+			byteArrayOutputStream.reset();				
+			
 		}
 		mfccWriter.close();
 	    	
